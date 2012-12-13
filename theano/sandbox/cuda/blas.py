@@ -7,7 +7,7 @@ from theano import Apply
 from theano import tensor
 from theano.sandbox.cuda.type import CudaNdarrayType
 from theano.sandbox.cuda import GpuOp
-
+from theano.sandbox.cuda.basic_ops import as_cuda_ndarray_variable
 
 class GpuDot22(GpuOp):
     """
@@ -1122,3 +1122,198 @@ class GpuDownsampleFactorMaxGrad(GpuOp):
             }
         }
         """ % locals()
+
+
+class GpuGemmBatched(GpuOp):
+    """
+    implement the gemm on the gpu.
+
+    """
+    def __str__(self):
+        return 'GpuGemmBatched'
+
+    def __eq__(self, other):
+        return type(self) == type(other)
+
+    def __hash__(self):
+        return hash(type(self))
+
+    def make_node(self, x, y):
+        # the more complicated error checking performed by tensor.gemm
+        # is assumed to already have been done
+        assert x.broadcastable[0] == y.broadcastable[0]
+        assert len(x.broadcastable) == 3
+        assert len(y.broadcastable) == 3
+        x = as_cuda_ndarray_variable(x)
+        y = as_cuda_ndarray_variable(y)
+        bcast = (x.broadcastable[0], x.broadcastable[1], y.broadcastable[1])
+        otype = CudaNdarrayType(bcast)
+        return Apply(self, [x, y], [otype()])
+
+    def grad(self, inputs, grads):
+        # Dimensions are as follows:
+        # gz \in R^(b,m,n), x \in R^(b,m,k) and \y in R^(b,k,n)
+        x_batch_T = inputs[0].dimshuffle([0,2,1])
+        y_batch_T = inputs[1].dimshuffle([0,2,1])
+        return [gpu_gemm_batched(grads[0], y_batch_T),
+                gpu_gemm_batched(x_batch_T, grads[0])]
+
+    def c_headers(self):
+        return ['cublas_v2.h', '<stdio.h>']
+
+    #def c_code_cache_version(self):
+        #return (1,)
+
+    def c_code(self, node, name, inputs, outputs, sub):
+        # for i in xrange(len(z)):
+        #    z_out[i] = 1.0 * dot(x[i],y[i]) + 0. * z_in[i]
+        x, y = inputs
+        z, = outputs
+        fail = sub['fail']
+        sio = StringIO.StringIO()
+        print >> sio, """
+
+        CudaNdarray* x = (CudaNdarray*) %(x)s;
+        CudaNdarray* y = (CudaNdarray*) %(y)s;
+        CudaNdarray* z = (CudaNdarray*) %(z)s;
+        CudaNdarray *cx=x, *cy=y;
+
+        const float **Alist = 0;
+        const float **Blist = 0;
+        float **Clist = 0;
+        float **devAlist = 0;
+        float **devBlist = 0;
+        float **devClist = 0;
+        float alpha = 1.0;
+        float beta = 0.0;
+        int batchCount = CudaNdarray_HOST_DIMS(x)[0];
+        int m, n, k, lda, ldb, ldc;
+        npy_intp dims[3];
+
+        cublasHandle_t handle;
+        cublasStatus_t stat;
+        cudaError_t cudaStat;
+        stat = cublasCreate(&handle);
+        if (stat != CUBLAS_STATUS_SUCCESS) {
+            PyErr_Format(PyExc_RuntimeError, "cublasCreate failed with code (%%i)", stat);
+            %(fail)s;
+        }
+
+        if (x->nd != 3 || y->nd != 3)
+        {
+            PyErr_SetString(PyExc_ValueError, "Args to gemm_batched should be 3-tensors");
+            %(fail)s;
+        }
+
+        // Check that x and y have dimensions (m,k) and (k,n) respectively.
+        if ((CudaNdarray_HOST_DIMS(x)[0] != CudaNdarray_HOST_DIMS(y)[0])
+                || (CudaNdarray_HOST_DIMS(x)[2] != CudaNdarray_HOST_DIMS(y)[1]))
+        {
+            PyErr_Format(PyExc_ValueError, "dimension mismatch in args to gemm (%%i,%%i,%%i)x(%%i,%%i,%%i)",
+                    CudaNdarray_HOST_DIMS(x)[0],
+                    CudaNdarray_HOST_DIMS(x)[1],
+                    CudaNdarray_HOST_DIMS(x)[2],
+                    CudaNdarray_HOST_DIMS(y)[0],
+                    CudaNdarray_HOST_DIMS(y)[1],
+                    CudaNdarray_HOST_DIMS(y)[2]);
+            %(fail)s;
+        }
+ 
+        // make sure that x is c-contiguous
+        if (!CudaNdarray_is_c_contiguous(x)) {
+            cx = (CudaNdarray*) CudaNdarray_Copy(x);
+            if (cx == NULL) {
+                PyErr_Format(PyExc_ValueError, "GpuGemmBatched: failed to alloc contiguous storage for x");
+                %(fail)s;
+            }
+        }
+
+        // make sure that y is c-contiguous
+        if (!CudaNdarray_is_c_contiguous(y)) {
+            cy = (CudaNdarray*) CudaNdarray_Copy(y);
+            if (cy == NULL) {
+                PyErr_Format(PyExc_ValueError, "GpuGemmBatched: failed to alloc contiguous storage for y");
+                %(fail)s;
+            }
+        }
+
+        dims[0] = CudaNdarray_HOST_DIMS(cx)[0];
+        dims[1] = CudaNdarray_HOST_DIMS(cx)[1];
+        dims[2] = CudaNdarray_HOST_DIMS(cy)[2];
+        %(z)s = (CudaNdarray*)CudaNdarray_New();
+        if ((NULL == %(z)s) || CudaNdarray_alloc_contiguous(%(z)s, 3, dims))
+        {
+            Py_XDECREF(%(z)s);
+            %(z)s = NULL;
+            PyErr_Format(PyExc_ValueError, "Failed to allocate output memory");
+            %(fail)s;
+        }
+
+        // Create appropriate strides for malformed matrices that are row or column vectors.
+        Alist = (const float**)malloc(batchCount * sizeof(float*));
+        Blist = (const float**)malloc(batchCount * sizeof(float*));
+        Clist = (float**)malloc(batchCount * sizeof(float*));
+        for (int i=0; i < batchCount; ++i) {
+            Alist[i] = CudaNdarray_DEV_DATA(cy) + i*CudaNdarray_HOST_STRIDES(cy)[0];
+            Blist[i] = CudaNdarray_DEV_DATA(cx) + i*CudaNdarray_HOST_STRIDES(cx)[0];
+            Clist[i] = CudaNdarray_DEV_DATA(%(z)s) + i*CudaNdarray_HOST_STRIDES(%(z)s)[0];
+        }
+
+        // copy pointer lists to device
+        cudaStat = cudaMalloc(&devAlist, batchCount * sizeof(float*));
+        assert(!cudaStat);
+        cudaStat = cudaMalloc(&devBlist, batchCount * sizeof(float*));
+        assert(!cudaStat);
+        cudaStat = cudaMalloc(&devClist, batchCount * sizeof(float*));
+        assert(!cudaStat);
+
+        cudaStat = cudaMemcpy(devAlist, Alist, batchCount * sizeof(float*), cudaMemcpyHostToDevice);
+        assert(!cudaStat);
+        cudaStat = cudaMemcpy(devBlist, Blist, batchCount * sizeof(float*), cudaMemcpyHostToDevice);
+        assert(!cudaStat);
+        cudaStat = cudaMemcpy(devClist, Clist, batchCount * sizeof(float*), cudaMemcpyHostToDevice);
+        assert(!cudaStat);
+
+        /*
+         * We want to compute the matrix product z = x y. Instead, we will compute z^T = (y^T
+         * x^T) and then (separately) take the transform. Since the output is assumed by gemm
+         * to be column-major format, we can simply get z by reading the output in row-major
+         * format. Mapping to the notation of cublasSgemmBatched, we get A:y, B:x.
+         */
+
+        m = CudaNdarray_HOST_DIMS(cy)[2];    // rows(A^T)
+        n = CudaNdarray_HOST_DIMS(cx)[1];    // cols(B^T)
+        k = CudaNdarray_HOST_DIMS(cy)[1];    // cols(A^T)
+        lda = CudaNdarray_HOST_DIMS(cy)[2];  // rows(A^T)
+        ldb = CudaNdarray_HOST_DIMS(cx)[2];  // rows(B^T)
+        ldc = CudaNdarray_HOST_DIMS(%(z)s)[2];  // rows(C^T)
+
+        stat = cublasSgemmBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                  m, n, k, &alpha,
+                                  (const float**)devAlist, lda,
+                                  (const float**)devBlist, ldb, &beta,
+                                  devClist, ldc, batchCount);
+        CNDA_THREAD_SYNC;
+        if (stat != CUBLAS_STATUS_SUCCESS) {
+            PyErr_Format(PyExc_RuntimeError, "cublasSgemmBatched failed with status (%%i)", stat);
+            Py_DECREF(%(z)s);
+            %(fail)s;
+        }
+
+        free(Alist);
+        free(Blist);
+        free(Clist);
+        cudaFree(devAlist);
+        cudaFree(devBlist);
+        cudaFree(devClist);
+        if (cx != x) {
+            Py_DECREF(cx);
+        }
+        if (cy != y) {
+            Py_DECREF(cy);
+        }
+        cublasDestroy(handle);
+        """
+        return sio.getvalue() % locals()
+
+gpu_gemm_batched = GpuGemmBatched()

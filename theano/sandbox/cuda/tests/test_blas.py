@@ -14,15 +14,16 @@ if cuda_ndarray.cuda_available == False:
     raise SkipTest('Optional package cuda disabled')
 
 import theano.sandbox.cuda as tcn
-
-from theano.tensor.signal.downsample import (DownsampleFactorMax,
+import theano.compile.mode
+from theano.tensor.signal.downsample import (
+        DownsampleFactorMax,
         DownsampleFactorMaxGrad)
 from theano.gof.python25 import any
-
-import theano.compile.mode
 from theano.tensor.tests.test_blas import BaseGemv, TestBlasStrides, TestGer
 from theano.sandbox.cuda.blas import gpu_gemv_no_inplace, gpu_gemv_inplace
 from theano.sandbox.cuda.blas import gpu_ger_inplace, gpu_ger_no_inplace
+from theano.sandbox.cuda.blas import gpu_gemm_batched
+from theano.tests import unittest_tools as utt
 
 
 if theano.config.mode == 'FAST_COMPILE':
@@ -501,3 +502,44 @@ class TestGpuGer_OpContract(TestCase, unittest_tools.T_OpContractMixin):
 
     def clone(self, op):
         return tcn.blas.GpuGer(op.inplace)
+
+class TestGpuGemmBatched(TestCase):
+
+    def setUp(self):
+        utt.seed_rng()
+
+    def test_matrix_matrix_cudainputs(self):
+        xval = numpy.random.rand(3,4,5).astype('float32')
+        yval = numpy.random.rand(3,5,6).astype('float32')
+        cref = numpy.zeros((xval.shape[0], xval.shape[1], yval.shape[2]), dtype='float32')
+        for i in xrange(len(xval)):
+            cref[i] = numpy.dot(xval[i], yval[i])
+
+        x = cuda_ndarray.CudaNdarrayType([False]*3)()
+        y = cuda_ndarray.CudaNdarrayType([False]*3)()
+        z = gpu_gemm_batched(x, y)
+        f = theano.function([x,y], z)
+        cval = f(xval, yval)
+        cval = numpy.asarray(cval)
+        assert numpy.allclose(cref, cval, 1e-3)
+
+    def test_matrix_matrix_shared(self):
+        xval = numpy.random.rand(3,4,5).astype('float32')
+        yval = numpy.random.rand(3,5,6).astype('float32')
+        cref = numpy.zeros((xval.shape[0], xval.shape[1], yval.shape[2]), dtype='float32')
+        for i in xrange(len(xval)):
+            cref[i] = numpy.dot(xval[i], yval[i])
+
+        x = theano.shared(xval, name='x')
+        y = theano.shared(yval, name='y')
+        z = gpu_gemm_batched(x, y)
+        f = theano.function([], z)
+        cval = f()
+        cval = numpy.asarray(cval)
+        assert numpy.allclose(cref, cval, 1e-3)
+
+    def test_grad(self):
+        xval = numpy.random.rand(3,4,5).astype('float32')
+        yval = numpy.random.rand(3,5,6).astype('float32')
+        func = lambda x,y: gpu_gemm_batched(x,y)
+        utt.verify_grad(func, [xval, yval])

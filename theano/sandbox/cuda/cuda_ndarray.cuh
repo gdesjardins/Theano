@@ -4,8 +4,6 @@
 #include <numpy/arrayobject.h>
 #include <stdio.h>
 
-#include <cublas.h>
-
 #ifdef _WIN32
 #ifdef _CUDA_NDARRAY_C
 #define DllExport   __declspec( dllexport )
