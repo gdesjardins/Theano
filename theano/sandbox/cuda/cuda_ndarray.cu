@@ -5,6 +5,7 @@
 
 #include <numpy/arrayobject.h>
 #include <iostream>
+#include <cublas.h>
 
 #include "cuda_ndarray.cuh"
 
