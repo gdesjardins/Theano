@@ -94,13 +94,18 @@ class Erfinv(UnaryScalarOp):
         else:
             return None,
 
+    def c_libraries(self):
+        return ['math.h']
+    def c_headers(self):
+        return ['math_functions.h', 'cublas_v2.h']
+
     # TODO: erfinv() is not provided by the C standard library
-    #def c_code(self, node, name, inp, out, sub):
-    #    x, = inp
-    #    z, = out
-    #    if node.inputs[0].type in complex_types:
-    #        raise NotImplementedError('type not supported', type)
-    #    return "%(z)s = erfinv(%(x)s);" % locals()
+    def c_code(self, node, name, inp, out, sub):
+        x, = inp
+        z, = out
+        if node.inputs[0].type in complex_types:
+            raise NotImplementedError('type not supported', type)
+        return "%(z)s = erfinv(%(x)s);" % locals()
 
 erfinv = Erfinv(upgrade_to_float_no_complex, name='erfinv')
 
