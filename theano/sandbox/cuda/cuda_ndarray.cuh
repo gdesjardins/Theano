@@ -40,6 +40,9 @@ typedef float real;
 #define SHARED_SIZE (16*1024)
 #endif
 
+#define VERBOSE_DEVICE_MALLOC 1
+#define NO_VERBOSE_DEVICE_MALLOC 0
+
 /**
  * Allocation and freeing of device memory should go through these functions so that the lib can track memory usage.
  *
@@ -47,6 +50,7 @@ typedef float real;
  * device_free will return nonzero on failure (after setting the python error message)
  */
 DllExport void * device_malloc(size_t size);
+DllExport void * device_malloc(size_t size, int verbose);
 DllExport int device_free(void * ptr);
 
 template <typename T>
